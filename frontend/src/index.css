@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    font-family: 'Epilogue', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-surface-light-2 text-heading-dark;
+    font-weight: 400;
+    margin: 0;
+    padding: 0;
+  }
+
+  body.dark {
+    @apply bg-surface-dark text-heading-light;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: 500;
+    @apply text-heading-dark;
+  }
+
+  .dark h1, .dark h2, .dark h3, .dark h4, .dark h5, .dark h6 {
+    @apply text-heading-light;
+  }
+
+  p, span, li {
+    font-weight: 400;
+    @apply text-para-dark;
+  }
+
+  .dark p, .dark span, .dark li {
+    @apply text-para-light;
+  }
+}
+
+@layer components {
+  /* Scrollbar styling */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 5px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-border-light rounded-full;
+  }
+
+  .dark .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-border-dark;
+  }
+
+  /* Message bubble prose overrides */
+  .prose-chat p {
+    margin: 0 0 0.5rem 0;
+    font-weight: 400;
+  }
+
+  .prose-chat p:last-child {
+    margin-bottom: 0;
+  }
+
+  .prose-chat ul, .prose-chat ol {
+    margin: 0.5rem 0;
+    padding-left: 1.25rem;
+  }
+
+  .prose-chat code {
+    background: rgba(0,0,0,0.08);
+    padding: 0.125rem 0.25rem;
+    border-radius: 3px;
+    font-size: 0.875em;
+  }
+
+  .dark .prose-chat code {
+    background: rgba(255,255,255,0.1);
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* Typing dots animation */
+.typing-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulseDot 1.4s ease-in-out infinite;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
