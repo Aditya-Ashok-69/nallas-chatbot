@@ -251,8 +251,3 @@ The free tier has generous limits. If exceeded, the error message will appear in
 **ChromaDB errors?**  
 Delete the `vectordb/` directory and restart to reset. All embeddings will be regenerated on re-upload.
 
----
-
-## License
-
-© Nallas Corporation. All rights reserved.
