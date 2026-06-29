@@ -7,9 +7,51 @@ import os
 import uuid
 import json
 import asyncio
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from contextlib import asynccontextmanager
+
+# ─── Logging Setup ────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
+logger = logging.getLogger("nallas.app")
+
+# Chat query log — one JSON line per query, appended forever
+CHAT_LOG_PATH = Path(os.getenv("CHAT_LOG_PATH", "./logs/chat_queries.jsonl"))
+CHAT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def log_query(
+    question: str,
+    answer: str,
+    sources: list,
+    status: str,          # "ok" | "no_results" | "error"
+    error: str = None,
+    duration_ms: int = None,
+):
+    """
+    Append one structured log entry per query to chat_queries.jsonl.
+    Each line is valid JSON — easy to grep, tail, or load into pandas.
+    """
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "question": question,
+        "answer": answer,
+        "sources": sources,
+    }
+    if duration_ms is not None:
+        entry["duration_ms"] = duration_ms
+    if error:
+        entry["error"] = error
+
+    with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,14 +95,14 @@ def save_registry(registry: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup."""
-    print("🚀 Initializing Nallas RAG Chatbot...")
+    logger.info("Initializing Nallas RAG Chatbot...")
     # Pre-load embedding model to cache it
     get_embedding_model()
     # Initialize vectorstore connection
     get_vectorstore()
-    print("✅ Services initialized successfully")
+    logger.info("Services initialized successfully")
     yield
-    print("👋 Shutting down...")
+    logger.info("Shutting down...")
 
 
 app = FastAPI(
@@ -156,6 +198,18 @@ async def upload_documents(
                 })
                 continue
 
+            # ── File size limit: 10 MB ────────────────────────────────────
+            MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "10")) * 1024 * 1024
+            if len(content) > MAX_FILE_SIZE:
+                size_mb = len(content) / (1024 * 1024)
+                results.append({
+                    "filename": file.filename,
+                    "status": "error",
+                    "error": f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_FILE_SIZE // (1024*1024)} MB."
+                })
+                logger.warning(f"Rejected oversized upload: {file.filename} ({size_mb:.1f} MB)")
+                continue
+
             with open(save_path, "wb") as f:
                 f.write(content)
 
@@ -201,7 +255,7 @@ async def process_document(doc_id: str, filepath: str, filename: str):
     registry = load_registry()
 
     try:
-        print(f"📄 Processing: {filename}")
+        logger.info(f"Processing document: {filename}")
 
         # Step 1: Extract text
         pages = extract_text(filepath)
@@ -229,10 +283,10 @@ async def process_document(doc_id: str, filepath: str, filename: str):
         registry[doc_id]["status"] = "ready"
         registry[doc_id]["chunks"] = len(chunks)
         save_registry(registry)
-        print(f"✅ Processed {filename}: {len(chunks)} chunks stored")
+        logger.info(f"Processed '{filename}': {len(chunks)} chunks stored")
 
     except Exception as e:
-        print(f"❌ Error processing {filename}: {e}")
+        logger.error(f"Error processing '{filename}': {e}", exc_info=True)
         if doc_id in registry:
             registry[doc_id]["status"] = "error"
             registry[doc_id]["error"] = str(e)
@@ -245,15 +299,27 @@ async def chat(request: ChatRequest):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    import time
+    t_start = time.perf_counter()
+
     try:
         # Step 1 & 2: Retrieve relevant chunks (hybrid search)
         chunks = hybrid_retrieve(request.question, top_k=5)
 
         if not chunks:
-            return ChatResponse(
-                answer="I could not find this information in the uploaded documents.",
-                sources=[]
+            # ── No results — log and return fallback ─────────────────────
+            fallback = "I could not find this information in the uploaded documents."
+            duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+            logger.warning(f"NO_RESULTS | question='{request.question[:120]}'")
+            log_query(
+                question=request.question,
+                answer=fallback,
+                sources=[],
+                status="no_results",
+                duration_ms=duration_ms,
             )
+            return ChatResponse(answer=fallback, sources=[])
 
         # Step 3: Build context
         context = "\n\n".join([c["text"] for c in chunks])
@@ -282,11 +348,35 @@ async def chat(request: ChatRequest):
                     "page_number": chunk["metadata"].get("page_number", 0)
                 })
 
+        duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+        # ── Successful query log ──────────────────────────────────────────
+        logger.info(f"OK | {duration_ms}ms | chunks={len(chunks)} sources={len(sources)} | question='{request.question[:120]}'")
+        log_query(
+            question=request.question,
+            answer=answer,
+            sources=sources,
+            status="ok",
+            duration_ms=duration_ms,
+        )
+
         return ChatResponse(answer=answer, sources=sources)
 
     except Exception as e:
-        print(f"❌ Chat error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+        duration_ms = int((time.perf_counter() - t_start) * 1000)
+        error_msg = str(e)
+
+        # ── Error query log ───────────────────────────────────────────────
+        logger.error(f"ERROR | {duration_ms}ms | question='{request.question[:120]}' | error='{error_msg}'", exc_info=True)
+        log_query(
+            question=request.question,
+            answer="An error occurred and no response was generated.",
+            sources=[],
+            status="error",
+            error=error_msg,
+            duration_ms=duration_ms,
+        )
+        raise HTTPException(status_code=500, detail=f"Error generating response: {error_msg}")
 
 
 @app.post("/chat/stream")
@@ -295,13 +385,28 @@ async def chat_stream(request: ChatRequest):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    import time
+    t_start = time.perf_counter()
+
     chunks = hybrid_retrieve(request.question, top_k=5)
 
     if not chunks:
+        fallback = "I could not find this information in the uploaded documents."
+        duration_ms = int((time.perf_counter() - t_start) * 1000)
+
+        logger.warning(f"NO_RESULTS (stream) | question='{request.question[:120]}'")
+        log_query(
+            question=request.question,
+            answer=fallback,
+            sources=[],
+            status="no_results",
+            duration_ms=duration_ms,
+        )
+
         async def no_results():
             data = json.dumps({
                 "type": "answer",
-                "content": "I could not find this information in the uploaded documents.",
+                "content": fallback,
                 "sources": []
             })
             yield f"data: {data}\n\n"
@@ -326,18 +431,49 @@ async def chat_stream(request: ChatRequest):
             })
 
     async def generate():
-        async for token in stream_answer(
-            question=request.question,
-            context=context,
-            conversation_history=conversation_history
-        ):
-            data = json.dumps({"type": "token", "content": token})
-            yield f"data: {data}\n\n"
+        full_answer = []
+        try:
+            async for token in stream_answer(
+                question=request.question,
+                context=context,
+                conversation_history=conversation_history
+            ):
+                full_answer.append(token)
+                data = json.dumps({"type": "token", "content": token})
+                yield f"data: {data}\n\n"
 
-        # Send sources at end
-        data = json.dumps({"type": "sources", "sources": sources})
-        yield f"data: {data}\n\n"
-        yield "data: [DONE]\n\n"
+            # Send sources at end
+            data = json.dumps({"type": "sources", "sources": sources})
+            yield f"data: {data}\n\n"
+            yield "data: [DONE]\n\n"
+
+            # ── Log successful streamed answer ────────────────────────────
+            duration_ms = int((time.perf_counter() - t_start) * 1000)
+            complete_answer = "".join(full_answer)
+            logger.info(f"OK (stream) | {duration_ms}ms | chunks={len(chunks)} | question='{request.question[:120]}'")
+            log_query(
+                question=request.question,
+                answer=complete_answer,
+                sources=sources,
+                status="ok",
+                duration_ms=duration_ms,
+            )
+
+        except Exception as e:
+            duration_ms = int((time.perf_counter() - t_start) * 1000)
+            error_msg = str(e)
+            logger.error(f"ERROR (stream) | {duration_ms}ms | question='{request.question[:120]}' | error='{error_msg}'", exc_info=True)
+            log_query(
+                question=request.question,
+                answer="".join(full_answer) or "Stream failed before any tokens were generated.",
+                sources=sources,
+                status="error",
+                error=error_msg,
+                duration_ms=duration_ms,
+            )
+            err_data = json.dumps({"type": "error", "content": f"Error: {error_msg}"})
+            yield f"data: {err_data}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
