@@ -21,25 +21,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nallas.app")
 
-# Chat query log — one JSON line per query, appended forever
-CHAT_LOG_PATH = Path(os.getenv("CHAT_LOG_PATH", "./logs/chat_queries.jsonl"))
-CHAT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+# Per-user log root — each user gets their own folder, one .jsonl file per day
+LOGS_ROOT = Path(os.getenv("CHAT_LOG_PATH", "./logs/users"))
+LOGS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _user_log_path(user_id: str) -> Path:
+    """
+    Return (and create) the log file path for a specific user and today's date.
+    Layout: logs/users/<user_id>/YYYY-MM-DD.jsonl
+    Sanitise user_id so it's safe as a directory name.
+    """
+    safe_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in user_id) or "anonymous"
+    user_dir = LOGS_ROOT / safe_id
+    user_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return user_dir / f"{date_str}.jsonl"
 
 
 def log_query(
     question: str,
     answer: str,
     sources: list,
-    status: str,          # "ok" | "no_results" | "error"
+    status: str,            # "ok" | "no_results" | "error"
+    user_id: str = "anonymous",
     error: str = None,
     duration_ms: int = None,
 ):
     """
-    Append one structured log entry per query to chat_queries.jsonl.
-    Each line is valid JSON — easy to grep, tail, or load into pandas.
+    Append one structured JSON line per query to that user's daily log file.
+
+    File layout:
+        logs/users/<user_id>/YYYY-MM-DD.jsonl
+
+    Every line is valid JSON:
+        - status "ok"         → full question + full answer + sources + timing
+        - status "no_results" → question + fallback answer + timing
+        - status "error"      → question + partial/empty answer + error detail + timing
+
+    Easy to grep, tail -f, or load into pandas / any log aggregator.
     """
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "user_id": user_id,
         "status": status,
         "question": question,
         "answer": answer,
@@ -50,7 +74,8 @@ def log_query(
     if error:
         entry["error"] = error
 
-    with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+    log_path = _user_log_path(user_id)
+    with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
@@ -69,6 +94,7 @@ from services.embeddings import get_embedding_model
 from services.vectorstore import get_vectorstore, delete_document_embeddings
 from services.retriever import retrieve_chunks, hybrid_retrieve
 from services.llm import stream_answer, get_answer
+from services.security import is_prompt_injection
 
 # Configuration
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
@@ -133,6 +159,7 @@ class ChatRequest(BaseModel):
     question: str
     conversation_history: Optional[List[ChatMessage]] = []
     stream: Optional[bool] = False
+    user_id: Optional[str] = "anonymous"   # passed in from HRMS; used for per-user log files
 
 
 class ChatResponse(BaseModel):
@@ -299,6 +326,16 @@ async def chat(request: ChatRequest):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    # Prompt injection detection
+    if is_prompt_injection(request.question):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Potential prompt injection detected. "
+                "Please ask questions related to the uploaded documents."
+            ),
+        )
+
     import time
     t_start = time.perf_counter()
 
@@ -311,12 +348,13 @@ async def chat(request: ChatRequest):
             fallback = "I could not find this information in the uploaded documents."
             duration_ms = int((time.perf_counter() - t_start) * 1000)
 
-            logger.warning(f"NO_RESULTS | question='{request.question[:120]}'")
+            logger.warning(f"NO_RESULTS | user={request.user_id} | question='{request.question[:120]}'")
             log_query(
                 question=request.question,
                 answer=fallback,
                 sources=[],
                 status="no_results",
+                user_id=request.user_id,
                 duration_ms=duration_ms,
             )
             return ChatResponse(answer=fallback, sources=[])
@@ -351,12 +389,13 @@ async def chat(request: ChatRequest):
         duration_ms = int((time.perf_counter() - t_start) * 1000)
 
         # ── Successful query log ──────────────────────────────────────────
-        logger.info(f"OK | {duration_ms}ms | chunks={len(chunks)} sources={len(sources)} | question='{request.question[:120]}'")
+        logger.info(f"OK | {duration_ms}ms | chunks={len(chunks)} sources={len(sources)} | user={request.user_id} | question='{request.question[:120]}'")
         log_query(
             question=request.question,
             answer=answer,
             sources=sources,
             status="ok",
+            user_id=request.user_id,
             duration_ms=duration_ms,
         )
 
@@ -367,12 +406,13 @@ async def chat(request: ChatRequest):
         error_msg = str(e)
 
         # ── Error query log ───────────────────────────────────────────────
-        logger.error(f"ERROR | {duration_ms}ms | question='{request.question[:120]}' | error='{error_msg}'", exc_info=True)
+        logger.error(f"ERROR | {duration_ms}ms | user={request.user_id} | question='{request.question[:120]}' | error='{error_msg}'", exc_info=True)
         log_query(
             question=request.question,
             answer="An error occurred and no response was generated.",
             sources=[],
             status="error",
+            user_id=request.user_id,
             error=error_msg,
             duration_ms=duration_ms,
         )
@@ -385,6 +425,15 @@ async def chat_stream(request: ChatRequest):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    # Prompt injection detection
+    if is_prompt_injection(request.question):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Potential prompt injection detected. "
+                "Please ask questions related to the uploaded documents."
+            ),
+        )
     import time
     t_start = time.perf_counter()
 
@@ -394,12 +443,13 @@ async def chat_stream(request: ChatRequest):
         fallback = "I could not find this information in the uploaded documents."
         duration_ms = int((time.perf_counter() - t_start) * 1000)
 
-        logger.warning(f"NO_RESULTS (stream) | question='{request.question[:120]}'")
+        logger.warning(f"NO_RESULTS (stream) | user={request.user_id} | question='{request.question[:120]}'")
         log_query(
             question=request.question,
             answer=fallback,
             sources=[],
             status="no_results",
+            user_id=request.user_id,
             duration_ms=duration_ms,
         )
 
@@ -450,24 +500,26 @@ async def chat_stream(request: ChatRequest):
             # ── Log successful streamed answer ────────────────────────────
             duration_ms = int((time.perf_counter() - t_start) * 1000)
             complete_answer = "".join(full_answer)
-            logger.info(f"OK (stream) | {duration_ms}ms | chunks={len(chunks)} | question='{request.question[:120]}'")
+            logger.info(f"OK (stream) | {duration_ms}ms | chunks={len(chunks)} | user={request.user_id} | question='{request.question[:120]}'")
             log_query(
                 question=request.question,
                 answer=complete_answer,
                 sources=sources,
                 status="ok",
+                user_id=request.user_id,
                 duration_ms=duration_ms,
             )
 
         except Exception as e:
             duration_ms = int((time.perf_counter() - t_start) * 1000)
             error_msg = str(e)
-            logger.error(f"ERROR (stream) | {duration_ms}ms | question='{request.question[:120]}' | error='{error_msg}'", exc_info=True)
+            logger.error(f"ERROR (stream) | {duration_ms}ms | user={request.user_id} | question='{request.question[:120]}' | error='{error_msg}'", exc_info=True)
             log_query(
                 question=request.question,
                 answer="".join(full_answer) or "Stream failed before any tokens were generated.",
                 sources=sources,
                 status="error",
+                user_id=request.user_id,
                 error=error_msg,
                 duration_ms=duration_ms,
             )
